@@ -8,6 +8,7 @@ db = SparkDatabase()
 
 tests = [
     ("list_transcripts", lambda: db.list_transcripts(limit=2)),
+    ("list_transcripts (date filter)", lambda: db.list_transcripts(start_date="2026-01-01T00:00:00", end_date="2026-12-31T23:59:59", limit=2)),
     ("get_transcript", lambda: db.get_transcript(message_pk=63336)),
     ("search_transcripts", lambda: db.search_transcripts(query="patent", limit=2)),
     ("get_statistics", lambda: db.get_statistics()),
