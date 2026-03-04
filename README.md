@@ -70,17 +70,15 @@ python -m spark_mcp.server
 List meeting transcripts with metadata.
 
 **Parameters:**
-- `startDate` (optional): Filter transcripts after this ISO date
-- `endDate` (optional): Filter transcripts before this ISO date
-- `includeAdHoc` (optional, default: true): Include ad-hoc meetings
-- `onlyKept` (optional, default: true): Only show kept transcripts
-- `limit` (optional, default: 50): Max results
-- `offset` (optional, default: 0): Pagination offset
+- `limit` (optional, default: 20): Max results
+- `after` (optional): Return transcripts with meetingStartDate after this ISO datetime (e.g., '2026-01-30T13:00:00')
+- `before` (optional): Return transcripts with meetingStartDate before this ISO datetime (e.g., '2026-01-30T16:00:00')
 
 **Example:**
 ```json
 {
-  "startDate": "2025-11-01",
+  "after": "2026-02-09T09:00:00",
+  "before": "2026-02-09T12:00:00",
   "limit": 10
 }
 ```

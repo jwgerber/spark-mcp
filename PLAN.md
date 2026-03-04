@@ -271,12 +271,9 @@ MCP Server
 **Parameters:**
 ```typescript
 {
-  startDate?: string,      // ISO date filter
-  endDate?: string,        // ISO date filter
-  includeAdHoc?: boolean,  // Include non-calendar meetings (default: true)
-  onlyKept?: boolean,      // Only kept transcripts (default: true)
-  limit?: number,          // Max results (default: 50)
-  offset?: number          // Pagination offset
+  limit?: number,          // Max results (default: 20)
+  after?: string,          // Return transcripts after this ISO datetime (e.g., '2026-01-30T13:00:00')
+  before?: string          // Return transcripts before this ISO datetime (e.g., '2026-01-30T16:00:00')
 }
 ```
 
