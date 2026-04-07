@@ -756,11 +756,12 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
         logger.info("File not found in tool %s", name, exc_info=True)
         return [TextContent(type="text", text="Error: file not found")]
     except ValueError as e:
-        # ValueErrors are typically caller-facing validation problems; the
-        # message itself is usually safe (field name, page number) but we
-        # still avoid interpolating arbitrary state.
+        # Do NOT interpolate the exception message — pypdf and PyMuPDF raise
+        # ValueError for malformed PDF internals with messages that can
+        # contain field names, geometry, or object IDs from attacker-
+        # controlled PDFs. Log server-side, return a generic message.
         logger.info("Invalid argument in tool %s: %s", name, e)
-        return [TextContent(type="text", text=f"Error: invalid argument ({e})")]
+        return [TextContent(type="text", text="Error: invalid argument")]
     except Exception:
         # Log the full traceback to stderr for the operator; return a
         # generic message to the LLM so we don't leak paths, SQL details,
