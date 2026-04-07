@@ -3,15 +3,29 @@
 
 import asyncio
 import json
+import logging
+import sys
+import traceback
 from typing import Any, Sequence
 from mcp.server import Server
 from mcp.types import Tool, TextContent, GetPromptResult
 from mcp.server.stdio import stdio_server
+from .config import UnsafePathError
 from .database import SparkDatabase
 from .pdf_operations import pdf_ops
 
 
-# Initialize database (errors will be logged by MCP framework)
+logger = logging.getLogger("spark_mcp")
+if not logger.handlers:
+    _h = logging.StreamHandler(sys.stderr)
+    _h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(_h)
+    logger.setLevel(logging.INFO)
+
+
+# Lazy DB init: constructing SparkDatabase only stores paths now, so this
+# won't fail even if Spark isn't installed — individual tools will surface
+# per-DB errors at call time.
 db = SparkDatabase()
 
 
@@ -729,8 +743,30 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
         else:
             return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
-    except Exception as e:
-        return [TextContent(type="text", text=f"Error: {str(e)}")]
+    except UnsafePathError:
+        # Path sandbox violation — do not echo the attempted path back to
+        # the model, since that just hands an injection attacker a confirmation
+        # channel. The full detail is logged server-side.
+        logger.warning("Sandbox violation in tool %s", name, exc_info=True)
+        return [TextContent(
+            type="text",
+            text="Error: path is outside the allowed directories or has an invalid extension"
+        )]
+    except FileNotFoundError:
+        logger.info("File not found in tool %s", name, exc_info=True)
+        return [TextContent(type="text", text="Error: file not found")]
+    except ValueError as e:
+        # ValueErrors are typically caller-facing validation problems; the
+        # message itself is usually safe (field name, page number) but we
+        # still avoid interpolating arbitrary state.
+        logger.info("Invalid argument in tool %s: %s", name, e)
+        return [TextContent(type="text", text=f"Error: invalid argument ({e})")]
+    except Exception:
+        # Log the full traceback to stderr for the operator; return a
+        # generic message to the LLM so we don't leak paths, SQL details,
+        # or tracebacks into a context an attacker may control.
+        logger.error("Unhandled error in tool %s\n%s", name, traceback.format_exc())
+        return [TextContent(type="text", text="Error: internal server error")]
 
 
 async def main():
