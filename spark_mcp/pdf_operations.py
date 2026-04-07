@@ -40,7 +40,12 @@ def _safe_output_pdf(output_path: Optional[str], default_name: str) -> Path:
 
 
 def _safe_signature_image(sig_path_arg: Optional[str]) -> Path:
-    """Resolve a signature image path (caller-supplied or configured default)."""
+    """Resolve a signature image path (caller-supplied or configured default).
+
+    Both paths go through ``resolve_safe_path``. In multi-MCP-server setups
+    another server could potentially write the config file, so the
+    "configured default" is not implicitly trusted.
+    """
     if sig_path_arg:
         return resolve_safe_path(
             sig_path_arg,
@@ -52,8 +57,11 @@ def _safe_signature_image(sig_path_arg: Optional[str]) -> Path:
         raise FileNotFoundError(
             "No signature image provided and no default configured"
         )
-    # The configured default is trusted; still resolve it.
-    return Path(default_sig).expanduser().resolve()
+    return resolve_safe_path(
+        default_sig,
+        must_exist=True,
+        require_suffix=[".png", ".jpg", ".jpeg"],
+    )
 
 
 class PDFOperations:
