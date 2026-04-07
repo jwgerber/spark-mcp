@@ -7,13 +7,53 @@ from typing import Optional, Dict, Any, List
 from .config import (
     get_signature_path, get_output_dir, get_templates_dir,
     load_template, save_template as save_template_config,
-    list_templates as list_templates_config, delete_template as delete_template_config
+    list_templates as list_templates_config, delete_template as delete_template_config,
+    resolve_safe_path, UnsafePathError
 )
 
 
 def _get_default_output_dir() -> Path:
     """Get the configured output directory."""
-    return Path(get_output_dir())
+    return Path(get_output_dir()).expanduser()
+
+
+def _safe_input_pdf(pdf_path: str) -> Path:
+    """Resolve a caller-supplied input PDF path inside the sandbox."""
+    return resolve_safe_path(pdf_path, must_exist=True, require_suffix=[".pdf"])
+
+
+def _safe_output_pdf(output_path: Optional[str], default_name: str) -> Path:
+    """Resolve a caller-supplied output PDF path inside the sandbox.
+
+    Falls back to ``<default_output_dir>/<default_name>`` if no path given.
+    Parent directories are created only if they already live under an allowed
+    root (resolve_safe_path enforces this).
+    """
+    if output_path:
+        out = resolve_safe_path(output_path, require_suffix=[".pdf"])
+    else:
+        out = (_get_default_output_dir() / default_name).resolve()
+        # The default output dir must itself be inside an allowed root.
+        out = resolve_safe_path(str(out), require_suffix=[".pdf"])
+    out.parent.mkdir(parents=True, exist_ok=True)
+    return out
+
+
+def _safe_signature_image(sig_path_arg: Optional[str]) -> Path:
+    """Resolve a signature image path (caller-supplied or configured default)."""
+    if sig_path_arg:
+        return resolve_safe_path(
+            sig_path_arg,
+            must_exist=True,
+            require_suffix=[".png", ".jpg", ".jpeg"],
+        )
+    default_sig = get_signature_path()
+    if not default_sig:
+        raise FileNotFoundError(
+            "No signature image provided and no default configured"
+        )
+    # The configured default is trusted; still resolve it.
+    return Path(default_sig).expanduser().resolve()
 
 
 class PDFOperations:
@@ -30,10 +70,7 @@ class PDFOperations:
         """
         from pypdf import PdfReader
 
-        path = Path(pdf_path).expanduser()
-        if not path.exists():
-            raise FileNotFoundError(f"PDF not found: {pdf_path}")
-
+        path = _safe_input_pdf(pdf_path)
         reader = PdfReader(str(path))
         fields_dict = reader.get_fields()
 
@@ -89,18 +126,8 @@ class PDFOperations:
         """
         import fitz  # PyMuPDF
 
-        path = Path(pdf_path).expanduser()
-        if not path.exists():
-            raise FileNotFoundError(f"PDF not found: {pdf_path}")
-
-        # Determine output path
-        if output_path:
-            out_path = Path(output_path).expanduser()
-        else:
-            out_path = _get_default_output_dir() / f"{path.stem}_filled.pdf"
-
-        # Ensure output directory exists
-        out_path.parent.mkdir(parents=True, exist_ok=True)
+        path = _safe_input_pdf(pdf_path)
+        out_path = _safe_output_pdf(output_path, f"{path.stem}_filled.pdf")
 
         doc = fitz.open(str(path))
         fields_updated = 0
@@ -159,30 +186,9 @@ class PDFOperations:
         """
         import fitz  # PyMuPDF
 
-        path = Path(pdf_path).expanduser()
-
-        # Use configured default signature if not provided
-        if signature_image_path:
-            sig_path = Path(signature_image_path).expanduser()
-        else:
-            default_sig = get_signature_path()
-            if not default_sig:
-                raise FileNotFoundError("No signature image provided and no default configured")
-            sig_path = Path(default_sig)
-
-        if not path.exists():
-            raise FileNotFoundError(f"PDF not found: {pdf_path}")
-        if not sig_path.exists():
-            raise FileNotFoundError(f"Signature image not found: {sig_path}")
-
-        # Determine output path
-        if output_path:
-            out_path = Path(output_path).expanduser()
-        else:
-            out_path = _get_default_output_dir() / f"{path.stem}_signed.pdf"
-
-        # Ensure output directory exists
-        out_path.parent.mkdir(parents=True, exist_ok=True)
+        path = _safe_input_pdf(pdf_path)
+        sig_path = _safe_signature_image(signature_image_path)
+        out_path = _safe_output_pdf(output_path, f"{path.stem}_signed.pdf")
 
         # Open PDF with PyMuPDF
         doc = fitz.open(str(path))
@@ -273,29 +279,9 @@ class PDFOperations:
         """
         import fitz
 
-        path = Path(pdf_path).expanduser()
-
-        # Use configured default signature if not provided
-        if signature_image_path:
-            sig_path = Path(signature_image_path).expanduser()
-        else:
-            default_sig = get_signature_path()
-            if not default_sig:
-                raise FileNotFoundError("No signature image provided and no default configured")
-            sig_path = Path(default_sig)
-
-        if not path.exists():
-            raise FileNotFoundError(f"PDF not found: {pdf_path}")
-        if not sig_path.exists():
-            raise FileNotFoundError(f"Signature image not found: {sig_path}")
-
-        # Determine output path
-        if output_path:
-            out_path = Path(output_path).expanduser()
-        else:
-            out_path = _get_default_output_dir() / f"{path.stem}_filled_signed.pdf"
-
-        out_path.parent.mkdir(parents=True, exist_ok=True)
+        path = _safe_input_pdf(pdf_path)
+        sig_path = _safe_signature_image(signature_image_path)
+        out_path = _safe_output_pdf(output_path, f"{path.stem}_filled_signed.pdf")
 
         doc = fitz.open(str(path))
         fields_updated = 0
@@ -461,16 +447,8 @@ class PDFOperations:
         """
         import fitz
 
-        path = Path(pdf_path).expanduser()
-        if not path.exists():
-            raise FileNotFoundError(f"PDF not found: {pdf_path}")
-
-        if output_path:
-            out_path = Path(output_path).expanduser()
-        else:
-            out_path = _get_default_output_dir() / f"{path.stem}_annotated.pdf"
-
-        out_path.parent.mkdir(parents=True, exist_ok=True)
+        path = _safe_input_pdf(pdf_path)
+        out_path = _safe_output_pdf(output_path, f"{path.stem}_annotated.pdf")
 
         doc = fitz.open(str(path))
         annotations_added = 0
@@ -550,10 +528,7 @@ class PDFOperations:
         """
         import fitz
 
-        path = Path(pdf_path).expanduser()
-        if not path.exists():
-            raise FileNotFoundError(f"PDF not found: {pdf_path}")
-
+        path = _safe_input_pdf(pdf_path)
         doc = fitz.open(str(path))
         pages_info = []
 
@@ -724,20 +699,14 @@ class PDFOperations:
         import fitz
         from datetime import datetime
 
-        path = Path(pdf_path).expanduser()
-        if not path.exists():
-            raise FileNotFoundError(f"PDF not found: {pdf_path}")
+        path = _safe_input_pdf(pdf_path)
 
+        # load_template validates template_name for traversal safety
         template = load_template(template_name)
         if not template:
             raise ValueError(f"Template not found: {template_name}")
 
-        if output_path:
-            out_path = Path(output_path).expanduser()
-        else:
-            out_path = _get_default_output_dir() / f"{path.stem}_filled.pdf"
-
-        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path = _safe_output_pdf(output_path, f"{path.stem}_filled.pdf")
 
         doc = fitz.open(str(path))
         fields_filled = 0
@@ -764,13 +733,10 @@ class PDFOperations:
             if field_type == "signature":
                 if sign:
                     # Add signature at this position
-                    if signature_image_path:
-                        sig_path = Path(signature_image_path).expanduser()
-                    else:
-                        default_sig = get_signature_path()
-                        if not default_sig:
-                            continue
-                        sig_path = Path(default_sig)
+                    try:
+                        sig_path = _safe_signature_image(signature_image_path)
+                    except (FileNotFoundError, UnsafePathError):
+                        continue
 
                     if sig_path.exists():
                         if page_num == -1:
