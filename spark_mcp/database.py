@@ -2,23 +2,175 @@
 
 import sqlite3
 import json
+import re
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
-from datetime import datetime
+from datetime import datetime, timedelta
 
 
 SPARK_BASE = Path.home() / "Library/Containers/com.readdle.SparkDesktop.appstore/Data/Library/Application Support/Spark Desktop/core-data"
 SPARK_CACHE = Path.home() / "Library/Containers/com.readdle.SparkDesktop.appstore/Data/Library/Caches/Spark Desktop"
 
 
+# Generic localparts that should not be treated as person names when building
+# fuzzy match candidates from a display name.
+_GENERIC_LOCALPARTS = {
+    "info", "support", "noreply", "no-reply", "do-not-reply",
+    "hello", "team", "admin", "contact", "help", "service",
+    "notifications", "alerts", "news", "marketing",
+}
+
+
+def _localpart_candidates(name: str) -> List[str]:
+    """Generate plausible email localparts for a person's name.
+
+    For "Christine Taylo" returns: christine.taylo, ctaylo, christinet,
+    christine, taylo, christine_taylo, christinetaylo.
+    Returns an empty list if the name doesn't look like a person name.
+    """
+    if not name:
+        return []
+    # Treat anything with @ or a TLD-looking suffix as not-a-name.
+    if "@" in name or re.search(r"\.[a-z]{2,}$", name, re.IGNORECASE):
+        return []
+    parts = [p for p in re.split(r"\s+", name.strip()) if p]
+    parts = [re.sub(r"[^A-Za-z\-']", "", p).lower() for p in parts]
+    parts = [p for p in parts if p]
+    if not parts:
+        return []
+    if len(parts) == 1:
+        return [parts[0]]
+    first, last = parts[0], parts[-1]
+    candidates = {
+        f"{first}.{last}",
+        f"{first[0]}{last}",
+        f"{first}{last[0]}",
+        f"{first}_{last}",
+        f"{first}{last}",
+        first,
+        last,
+    }
+    # Filter out single-char candidates and generic strings.
+    return sorted(c for c in candidates if len(c) >= 2 and c not in _GENERIC_LOCALPARTS)
+
+
+def _parse_display_name(message_from: str) -> Optional[str]:
+    """Extract the display name from a From header. Returns None if none."""
+    if not message_from:
+        return None
+    # Patterns: '"Display Name" <email@domain>', 'Display Name <email@domain>', 'email@domain'
+    m = re.match(r'^\s*"?([^"<]+?)"?\s*<[^>]+>\s*$', message_from)
+    if m:
+        name = m.group(1).strip()
+        return name if name and "@" not in name else None
+    return None
+
+
+# SQL expression that extracts the display-name portion of a `From` header.
+# For `"Marie Keup" <m.keup@taylorwessing.com>` it returns `"marie keup" `.
+# For `ctaylo@uchicago.edu` (no `<...>`) it returns NULL so LIKE comparisons
+# don't false-match a substring of the email address.
+_DISPLAY_NAME_EXPR = (
+    "CASE WHEN messageFrom LIKE '%<%>%' "
+    "THEN LOWER(SUBSTR(messageFrom, 1, INSTR(messageFrom, '<') - 1)) "
+    "ELSE NULL END"
+)
+
+
+def _build_sender_clause(
+    sender_name: Optional[str] = None,
+    sender_email: Optional[str] = None,
+    sender_domain: Optional[str] = None,
+    fuzzy: bool = True,
+    body_match_pks: Optional[List[int]] = None,
+) -> Tuple[Optional[str], List[Any], List[str]]:
+    """Build a SQL fragment AND-ing the structured sender filters.
+
+    For `sender_name`, the substring match runs against the *display name*
+    portion of `messageFrom` only — NOT the email address — so "Taylo" no
+    longer false-matches `m.keup@taylorwessing.com` or `taylor.swift@...`.
+
+    When `body_match_pks` is supplied, those pks are OR-ed into the sender_name
+    branch — this is how the signature body fallback contributes header-less
+    rows (e.g. `ctaylo@uchicago.edu` signed "Christine Taylo").
+
+    Returns (clause_or_None, params, fuzzy_matches_used).
+    """
+    clauses: List[str] = []
+    params: List[Any] = []
+    fuzzy_used: List[str] = []
+
+    if sender_name:
+        sub_clauses = [f"{_DISPLAY_NAME_EXPR} LIKE ?"]
+        params.append(f"%{sender_name.lower()}%")
+        if fuzzy:
+            cands = _localpart_candidates(sender_name)
+            for c in cands:
+                sub_clauses.append("LOWER(messageFromMailbox) LIKE ?")
+                params.append(f"{c}@%")
+            fuzzy_used = cands
+        if body_match_pks:
+            placeholders = ",".join("?" * len(body_match_pks))
+            sub_clauses.append(f"pk IN ({placeholders})")
+            params.extend(body_match_pks)
+        clauses.append("(" + " OR ".join(sub_clauses) + ")")
+
+    if sender_email:
+        if "@" in sender_email:
+            clauses.append("LOWER(messageFromMailbox) = ?")
+            params.append(sender_email.lower())
+        else:
+            clauses.append("LOWER(messageFromMailbox) LIKE ?")
+            params.append(f"%{sender_email.lower()}%@%")
+
+    if sender_domain:
+        clauses.append("LOWER(messageFromDomain) = ?")
+        params.append(sender_domain.lower())
+
+    if not clauses:
+        return None, [], fuzzy_used
+
+    return " AND ".join(clauses), params, fuzzy_used
+
+
+def _resolve_legacy_sender(sender: str) -> List[Tuple[str, Dict[str, Any]]]:
+    """Map a legacy `sender` value to a priority-ordered list of attempts.
+
+    Each attempt is (matched_on, structured_kwargs) tried until one returns rows.
+    """
+    s = sender.strip()
+    attempts: List[Tuple[str, Dict[str, Any]]] = []
+    # If it has an @, try email first (highest precision).
+    if "@" in s:
+        attempts.append(("sender_email", {"sender_email": s}))
+    else:
+        # Name first (covers display-name substring + fuzzy localpart).
+        attempts.append(("sender_name", {"sender_name": s}))
+        # If it looks like a localpart (no spaces, ascii-ish), try email substring too.
+        if re.match(r"^[A-Za-z0-9._\-]+$", s):
+            attempts.append(("sender_email", {"sender_email": s}))
+        # If it looks like a domain, try domain.
+        if re.search(r"\.[A-Za-z]{2,}$", s):
+            attempts.append(("sender_domain", {"sender_domain": s}))
+    return attempts
+
+
 class SparkDatabase:
     """Access Spark Desktop SQLite databases in read-only mode."""
 
-    def __init__(self):
-        """Initialize database connections."""
-        self.messages_db_path = SPARK_BASE / "messages.sqlite"
-        self.search_db_path = SPARK_BASE / "search_fts5.sqlite"
-        self.calendar_db_path = SPARK_BASE / "calendarsapi.sqlite"
+    def __init__(self, base_dir: Optional[Path] = None, cache_dir: Optional[Path] = None):
+        """Initialize database connections.
+
+        Args:
+            base_dir: Override the Spark core-data directory (for tests).
+            cache_dir: Override the Spark cache directory (for tests).
+        """
+        base = Path(base_dir) if base_dir else SPARK_BASE
+        self.base_dir = base
+        self.cache_dir = Path(cache_dir) if cache_dir else SPARK_CACHE
+        self.messages_db_path = base / "messages.sqlite"
+        self.search_db_path = base / "search_fts5.sqlite"
+        self.calendar_db_path = base / "calendarsapi.sqlite"
 
         if not self.messages_db_path.exists():
             raise FileNotFoundError(f"Messages database not found at {self.messages_db_path}")
@@ -435,37 +587,84 @@ class SparkDatabase:
 
     def list_emails(
         self,
-        folder: str = "inbox",
+        folder: Optional[str] = None,
         unread_only: bool = False,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
         sender: Optional[str] = None,
+        sender_name: Optional[str] = None,
+        sender_email: Optional[str] = None,
+        sender_domain: Optional[str] = None,
+        fuzzy: bool = True,
+        signature_fallback: bool = True,
+        verbose: bool = False,
         limit: int = 50,
         offset: int = 0
     ) -> Dict[str, Any]:
         """List emails with filtering.
 
         Args:
-            folder: Filter by folder (inbox, sent, drafts, all)
+            folder: Filter by folder (inbox, sent, drafts, all). If None
+                (omitted), defaults to "inbox" UNLESS a sender filter is set,
+                in which case it broadens to "all" — archived emails are a
+                common source of "not findable" surprises.
             unread_only: Only show unread emails
             start_date: Filter after this ISO date
             end_date: Filter before this ISO date
-            sender: Filter by sender email
+            sender: Legacy convenience filter; tries name -> email -> domain.
+            sender_name: Match display name in From header (substring, case-insensitive)
+                or signature body (fallback). Optional localpart heuristics via `fuzzy`.
+            sender_email: Exact match if contains '@', else substring of localpart.
+            sender_domain: Exact match (case-insensitive) on sender's email domain.
+            fuzzy: When matching sender_name, also try localpart variants like
+                'ctaylo' or 'christine.taylo' against the email address.
+            signature_fallback: When sender_name matches no headers, search the
+                message body via FTS5 for the name (catches emails where the
+                display name only appears in the signature).
+            verbose: Include a `diagnostics` block in the response.
             limit: Maximum results
             offset: Pagination offset
 
         Returns:
-            Dict with 'emails' list and 'total' count
+            Dict with 'emails' list, 'total' count, and (when verbose) 'diagnostics'.
         """
-        conn = self._connect_messages()
+        has_sender_filter = bool(sender or sender_name or sender_email or sender_domain)
+        if folder is None:
+            folder = "all" if has_sender_filter else "inbox"
 
-        where_clauses = []
-        params = []
+        base_clauses, base_params = self._build_email_base_filters(
+            folder, unread_only, start_date, end_date
+        )
 
-        # Exclude transcripts
-        where_clauses.append("(meta NOT LIKE '%mtid%' OR meta IS NULL)")
+        emails, total, diagnostics = self._query_emails_with_sender(
+            base_clauses,
+            base_params,
+            sender=sender,
+            sender_name=sender_name,
+            sender_email=sender_email,
+            sender_domain=sender_domain,
+            fuzzy=fuzzy,
+            signature_fallback=signature_fallback,
+            limit=limit,
+            offset=offset,
+        )
 
-        # Folder filtering
+        result: Dict[str, Any] = {'emails': emails, 'total': total}
+        if verbose:
+            result['diagnostics'] = diagnostics
+        return result
+
+    def _build_email_base_filters(
+        self,
+        folder: str,
+        unread_only: bool,
+        start_date: Optional[str],
+        end_date: Optional[str],
+    ) -> Tuple[List[str], List[Any]]:
+        """Build the non-sender WHERE clauses shared between list/search emails."""
+        where_clauses = ["(meta NOT LIKE '%mtid%' OR meta IS NULL)"]
+        params: List[Any] = []
+
         if folder == "inbox":
             where_clauses.append("inInbox = 1")
         elif folder == "sent":
@@ -486,39 +685,149 @@ class SparkDatabase:
             where_clauses.append("receivedDate <= ?")
             params.append(end_ts)
 
-        if sender:
-            where_clauses.append("messageFrom LIKE ?")
-            params.append(f"%{sender}%")
+        return where_clauses, params
 
-        where_clause = " AND ".join(where_clauses)
+    def _query_emails_with_sender(
+        self,
+        base_clauses: List[str],
+        base_params: List[Any],
+        sender: Optional[str],
+        sender_name: Optional[str],
+        sender_email: Optional[str],
+        sender_domain: Optional[str],
+        fuzzy: bool,
+        signature_fallback: bool,
+        limit: int,
+        offset: int,
+    ) -> Tuple[List[Dict[str, Any]], int, Dict[str, Any]]:
+        """Run the list_emails query with sender filtering and fallbacks.
 
-        # Get total count
-        count_query = f"SELECT COUNT(*) as count FROM messages WHERE {where_clause}"
-        cursor = conn.execute(count_query, params)
-        total = cursor.fetchone()['count']
-
-        # Get emails
-        query = f"""
-            SELECT
-                pk,
-                subject,
-                messageFrom as sender,
-                messageTo as recipients,
-                datetime(receivedDate, 'unixepoch') as receivedDate,
-                unseen,
-                starred,
-                conversationPk,
-                numberOfFileAttachments
-            FROM messages
-            WHERE {where_clause}
-            ORDER BY receivedDate DESC
-            LIMIT ? OFFSET ?
+        Returns (emails, total, diagnostics).
         """
+        diagnostics: Dict[str, Any] = {
+            "matched_on": None,
+            "fuzzy_matches_used": [],
+            "signature_match_used": False,
+        }
 
-        params.extend([limit, offset])
-        cursor = conn.execute(query, params)
-        rows = cursor.fetchall()
-        conn.close()
+        def run(where_clauses: List[str], params: List[Any]) -> Tuple[List[Dict[str, Any]], int]:
+            return self._run_messages_query(where_clauses, params, limit, offset)
+
+        # Case 1: structured params given (one or more of sender_name/email/domain).
+        if sender_name or sender_email or sender_domain:
+            body_pks: List[int] = []
+            if sender_name and signature_fallback:
+                body_pks = self._fts_pks_for_name(sender_name)
+                diagnostics["signature_match_used"] = bool(body_pks)
+            clause, sparams, fuzzy_used = _build_sender_clause(
+                sender_name=sender_name,
+                sender_email=sender_email,
+                sender_domain=sender_domain,
+                fuzzy=fuzzy,
+                body_match_pks=body_pks,
+            )
+            diagnostics["fuzzy_matches_used"] = fuzzy_used
+            wc = list(base_clauses) + ([clause] if clause else [])
+            params = list(base_params) + sparams
+            emails, total = run(wc, params)
+            if sender_name:
+                diagnostics["matched_on"] = "sender_name"
+            elif sender_email:
+                diagnostics["matched_on"] = "sender_email"
+            else:
+                diagnostics["matched_on"] = "sender_domain"
+            return emails, total, diagnostics
+
+        # Case 2: legacy `sender` param. Try name -> email -> domain in priority
+        # order; return results from the first non-empty branch. The name
+        # branch unions header-display-name, fuzzy localpart, AND signature
+        # body matches (so sender="Taylo" still finds the Christine Taylo body).
+        if sender:
+            for matched_on, kwargs in _resolve_legacy_sender(sender):
+                body_pks_legacy: List[int] = []
+                if matched_on == "sender_name" and signature_fallback:
+                    body_pks_legacy = self._fts_pks_for_name(kwargs["sender_name"])
+                clause, sparams, fuzzy_used = _build_sender_clause(
+                    fuzzy=fuzzy, body_match_pks=body_pks_legacy, **kwargs
+                )
+                if not clause:
+                    continue
+                wc = list(base_clauses) + [clause]
+                params = list(base_params) + sparams
+                emails, total = run(wc, params)
+                if total > 0:
+                    diagnostics["matched_on"] = matched_on
+                    diagnostics["fuzzy_matches_used"] = fuzzy_used
+                    diagnostics["signature_match_used"] = bool(body_pks_legacy)
+                    return emails, total, diagnostics
+            return [], 0, diagnostics
+
+        # Case 3: no sender filter at all.
+        emails, total = run(list(base_clauses), list(base_params))
+        return emails, total, diagnostics
+
+    def _fts_pks_for_name(self, name: str, limit: int = 500) -> List[int]:
+        """Return message pks whose FTS body matches the given name as a phrase.
+
+        Used to surface emails where the sender's name appears only in the
+        signature, not the From header. Returns [] if FTS5 is unavailable or
+        the name has no usable tokens.
+        """
+        tokens = [re.sub(r"[^A-Za-z0-9]", "", t) for t in re.split(r"\s+", name.strip())]
+        tokens = [t for t in tokens if t]
+        if not tokens:
+            return []
+        fts_phrase = '"' + " ".join(tokens) + '"'
+        try:
+            search_conn = self._connect_search()
+        except sqlite3.OperationalError:
+            return []
+        try:
+            cursor = search_conn.execute(
+                "SELECT messagePk FROM messagesfts WHERE searchBody MATCH ? LIMIT ?",
+                (fts_phrase, limit),
+            )
+            return [row['messagePk'] for row in cursor.fetchall()]
+        except sqlite3.OperationalError:
+            return []
+        finally:
+            search_conn.close()
+
+    def _run_messages_query(
+        self,
+        where_clauses: List[str],
+        params: List[Any],
+        limit: int,
+        offset: int,
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """Execute the standard messages SELECT and return (emails, total)."""
+        conn = self._connect_messages()
+        try:
+            where_clause = " AND ".join(where_clauses) if where_clauses else "1=1"
+            count_query = f"SELECT COUNT(*) as count FROM messages WHERE {where_clause}"
+            cursor = conn.execute(count_query, params)
+            total = cursor.fetchone()['count']
+
+            query = f"""
+                SELECT
+                    pk,
+                    subject,
+                    messageFrom as sender,
+                    messageTo as recipients,
+                    datetime(receivedDate, 'unixepoch') as receivedDate,
+                    unseen,
+                    starred,
+                    conversationPk,
+                    numberOfFileAttachments
+                FROM messages
+                WHERE {where_clause}
+                ORDER BY receivedDate DESC
+                LIMIT ? OFFSET ?
+            """
+            cursor = conn.execute(query, list(params) + [limit, offset])
+            rows = cursor.fetchall()
+        finally:
+            conn.close()
 
         emails = []
         for row in rows:
@@ -533,8 +842,7 @@ class SparkDatabase:
                 'conversationPk': row['conversationPk'],
                 'hasAttachments': (row['numberOfFileAttachments'] or 0) > 0
             })
-
-        return {'emails': emails, 'total': total}
+        return emails, total
 
     def search_emails(
         self,
@@ -542,7 +850,12 @@ class SparkDatabase:
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
         sender: Optional[str] = None,
+        sender_name: Optional[str] = None,
+        sender_email: Optional[str] = None,
+        sender_domain: Optional[str] = None,
+        fuzzy: bool = True,
         sort_by: str = "relevance",
+        verbose: bool = False,
         limit: int = 20
     ) -> Dict[str, Any]:
         """Search emails using full-text search.
@@ -551,80 +864,157 @@ class SparkDatabase:
             query: Search query (FTS5 syntax)
             start_date: Filter after this ISO date
             end_date: Filter before this ISO date
-            sender: Filter by sender email/name (partial match)
+            sender: Legacy convenience filter; tries name -> email -> domain.
+            sender_name: Match display name in From header (substring) or
+                signature body (fallback). Honors `fuzzy` for localpart heuristics.
+            sender_email: Exact match if contains '@', else substring of localpart.
+            sender_domain: Exact match (case-insensitive) on sender's email domain.
+            fuzzy: When matching sender_name, also try common localpart variants.
             sort_by: "relevance" or "date" (newest first)
+            verbose: Include a `diagnostics` block in the response.
             limit: Maximum results
 
         Returns:
-            Dict with 'results' list and 'total' count
+            Dict with 'results' list, 'total' count, and (when verbose) 'diagnostics'.
         """
-        search_conn = self._connect_search()
+        diagnostics: Dict[str, Any] = {
+            "matched_on": None,
+            "fuzzy_matches_used": [],
+            "signature_fallback_used": False,
+        }
 
-        # FTS5 query
-        fts_query = """
-            SELECT
-                messagePk,
-                snippet(messagesfts, 4, '<mark>', '</mark>', '...', 64) as excerpt,
-                rank
-            FROM messagesfts
-            WHERE searchBody MATCH ?
-            ORDER BY rank
-            LIMIT ?
-        """
-
-        cursor = search_conn.execute(fts_query, (query, limit * 2))
-        fts_rows = cursor.fetchall()
-        search_conn.close()
-
+        fts_rows = self._fts_body_search(query, limit * 2)
         if not fts_rows:
-            return {'results': [], 'total': 0}
+            result: Dict[str, Any] = {'results': [], 'total': 0}
+            if verbose:
+                result['diagnostics'] = diagnostics
+            return result
 
-        # Get message metadata (excluding transcripts)
+        results, used_diag = self._filter_fts_by_sender(
+            fts_rows,
+            start_date=start_date,
+            end_date=end_date,
+            sender=sender,
+            sender_name=sender_name,
+            sender_email=sender_email,
+            sender_domain=sender_domain,
+            fuzzy=fuzzy,
+            sort_by=sort_by,
+            limit=limit,
+        )
+        diagnostics.update(used_diag)
+
+        result = {'results': results, 'total': len(results)}
+        if verbose:
+            result['diagnostics'] = diagnostics
+        return result
+
+    def _fts_body_search(self, query: str, limit: int) -> List[sqlite3.Row]:
+        """Run the FTS5 body search and return matching rows."""
+        search_conn = self._connect_search()
+        try:
+            cursor = search_conn.execute(
+                """
+                SELECT
+                    messagePk,
+                    snippet(messagesfts, 4, '<mark>', '</mark>', '...', 64) as excerpt,
+                    rank
+                FROM messagesfts
+                WHERE searchBody MATCH ?
+                ORDER BY rank
+                LIMIT ?
+                """,
+                (query, limit),
+            )
+            return cursor.fetchall()
+        finally:
+            search_conn.close()
+
+    def _filter_fts_by_sender(
+        self,
+        fts_rows: List[sqlite3.Row],
+        start_date: Optional[str],
+        end_date: Optional[str],
+        sender: Optional[str],
+        sender_name: Optional[str],
+        sender_email: Optional[str],
+        sender_domain: Optional[str],
+        fuzzy: bool,
+        sort_by: str,
+        limit: int,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """Filter FTS-matched messages by sender and date, return ordered results."""
+        diagnostics: Dict[str, Any] = {}
         message_pks = [row['messagePk'] for row in fts_rows]
-        conn = self._connect_messages()
-
         placeholders = ','.join('?' * len(message_pks))
-        where_clauses = [
+        base_clauses = [
             f"pk IN ({placeholders})",
-            "(meta NOT LIKE '%mtid%' OR meta IS NULL)"
+            "(meta NOT LIKE '%mtid%' OR meta IS NULL)",
         ]
-        params = list(message_pks)
+        base_params: List[Any] = list(message_pks)
 
         if start_date:
             start_ts = int(datetime.fromisoformat(start_date).timestamp())
-            where_clauses.append("receivedDate >= ?")
-            params.append(start_ts)
-
+            base_clauses.append("receivedDate >= ?")
+            base_params.append(start_ts)
         if end_date:
             end_ts = int(datetime.fromisoformat(end_date).timestamp())
-            where_clauses.append("receivedDate <= ?")
-            params.append(end_ts)
+            base_clauses.append("receivedDate <= ?")
+            base_params.append(end_ts)
 
-        if sender:
-            where_clauses.append("messageFrom LIKE ?")
-            params.append(f"%{sender}%")
+        # Determine sender clause.
+        sender_clause: Optional[str] = None
+        sender_params: List[Any] = []
+        matched_on: Optional[str] = None
+        fuzzy_used: List[str] = []
 
-        where_clause = " AND ".join(where_clauses)
+        if sender_name or sender_email or sender_domain:
+            sender_clause, sender_params, fuzzy_used = _build_sender_clause(
+                sender_name=sender_name,
+                sender_email=sender_email,
+                sender_domain=sender_domain,
+                fuzzy=fuzzy,
+            )
+            if sender_name:
+                matched_on = "sender_name"
+            elif sender_email:
+                matched_on = "sender_email"
+            else:
+                matched_on = "sender_domain"
+        elif sender:
+            # Legacy: try priority chain, picking the first non-empty match.
+            for attempt_label, kwargs in _resolve_legacy_sender(sender):
+                clause, sparams, used = _build_sender_clause(fuzzy=fuzzy, **kwargs)
+                if not clause:
+                    continue
+                metadata = self._fetch_message_metadata(
+                    base_clauses + [clause], base_params + sparams
+                )
+                if metadata:
+                    sender_clause = clause
+                    sender_params = sparams
+                    matched_on = attempt_label
+                    fuzzy_used = used
+                    break
+            else:
+                metadata = []
+        else:
+            metadata = None  # sentinel: fetch below
 
-        query_sql = f"""
-            SELECT
-                pk,
-                subject,
-                messageFrom as sender,
-                datetime(receivedDate, 'unixepoch') as receivedDate,
-                receivedDate as receivedTimestamp
-            FROM messages
-            WHERE {where_clause}
-        """
+        # If sender filter didn't already resolve metadata, fetch now.
+        where_clauses = list(base_clauses)
+        params = list(base_params)
+        if sender_clause:
+            where_clauses.append(sender_clause)
+            params.extend(sender_params)
+        metadata_rows = self._fetch_message_metadata(where_clauses, params)
 
-        cursor = conn.execute(query_sql, params)
-        metadata_rows = cursor.fetchall()
-        conn.close()
+        diagnostics["matched_on"] = matched_on
+        diagnostics["fuzzy_matches_used"] = fuzzy_used
 
-        # Join results
+        # Join FTS results with metadata.
         metadata_map = {row['pk']: row for row in metadata_rows}
-
-        results = []
+        results: List[Dict[str, Any]] = []
         for fts_row in fts_rows:
             pk = fts_row['messagePk']
             if pk in metadata_map:
@@ -639,19 +1029,153 @@ class SparkDatabase:
                     'relevanceScore': -fts_row['rank']
                 })
 
-        # Sort results
         if sort_by == "date":
             results.sort(key=lambda x: x['receivedTimestamp'], reverse=True)
-        # else: keep FTS relevance order
 
-        # Apply limit after sorting
         results = results[:limit]
-
-        # Remove internal timestamp field
         for r in results:
             del r['receivedTimestamp']
+        return results, diagnostics
 
-        return {'results': results, 'total': len(results)}
+    def _fetch_message_metadata(
+        self, where_clauses: List[str], params: List[Any]
+    ) -> List[sqlite3.Row]:
+        """Fetch metadata rows for the join in search_emails."""
+        conn = self._connect_messages()
+        try:
+            where_clause = " AND ".join(where_clauses) if where_clauses else "1=1"
+            cursor = conn.execute(
+                f"""
+                SELECT
+                    pk,
+                    subject,
+                    messageFrom as sender,
+                    datetime(receivedDate, 'unixepoch') as receivedDate,
+                    receivedDate as receivedTimestamp
+                FROM messages
+                WHERE {where_clause}
+                """,
+                params,
+            )
+            return cursor.fetchall()
+        finally:
+            conn.close()
+
+    def index_status(self, stale_threshold_minutes: int = 30) -> Dict[str, Any]:
+        """Report the state of Spark's underlying message store.
+
+        This is a read-only diagnostic. The Spark client owns sync; this MCP
+        only reads its store. Use this when a query returns no results to
+        distinguish "no such email" from "Spark hasn't fetched it yet".
+
+        Args:
+            stale_threshold_minutes: An account is flagged stale if its newest
+                message is older than this many minutes. Default: 30.
+
+        Returns:
+            Dict with per-account counts/timestamps, folder counts, FTS row
+            count, and an `owned_by` note clarifying who manages sync.
+        """
+        conn = self._connect_messages()
+        try:
+            cursor = conn.execute(
+                """
+                SELECT pk, accountTitle, ownerFullName
+                FROM accounts
+                ORDER BY pk
+                """
+            )
+            accounts_rows = cursor.fetchall()
+
+            accounts: List[Dict[str, Any]] = []
+            now_ts = datetime.now().timestamp()
+            stale_cutoff = stale_threshold_minutes * 60
+            stale_any = False
+
+            for acc in accounts_rows:
+                acc_pk = acc['pk']
+                cursor = conn.execute(
+                    """
+                    SELECT
+                        COUNT(*) as total,
+                        MIN(receivedDate) as oldest_ts,
+                        MAX(receivedDate) as newest_ts
+                    FROM messages
+                    WHERE accountPk = ?
+                      AND (meta NOT LIKE '%mtid%' OR meta IS NULL)
+                    """,
+                    (acc_pk,),
+                )
+                msg_row = cursor.fetchone()
+                total = msg_row['total'] or 0
+                newest_ts = msg_row['newest_ts']
+                oldest_ts = msg_row['oldest_ts']
+
+                # Per-folder counts (top-level folders by name).
+                cursor = conn.execute(
+                    """
+                    SELECT folderName, COUNT(*) as count
+                    FROM folders
+                    WHERE accountPk = ?
+                    GROUP BY folderName
+                    ORDER BY folderName
+                    """,
+                    (acc_pk,),
+                )
+                folder_counts = [
+                    {"name": row['folderName'], "folder_count": row['count']}
+                    for row in cursor.fetchall()
+                ]
+
+                is_stale = bool(
+                    newest_ts is not None and (now_ts - newest_ts) > stale_cutoff
+                )
+                if is_stale or total == 0:
+                    stale_any = True
+
+                accounts.append({
+                    "accountPk": acc_pk,
+                    "accountTitle": acc['accountTitle'],
+                    "ownerFullName": acc['ownerFullName'],
+                    "totalMessages": total,
+                    "newestMessageAt": (
+                        datetime.fromtimestamp(newest_ts).isoformat()
+                        if newest_ts else None
+                    ),
+                    "oldestMessageAt": (
+                        datetime.fromtimestamp(oldest_ts).isoformat()
+                        if oldest_ts else None
+                    ),
+                    "stale": is_stale,
+                    "folders": folder_counts,
+                })
+        finally:
+            conn.close()
+
+        # FTS row count.
+        fts_row_count = 0
+        try:
+            search_conn = self._connect_search()
+            try:
+                cursor = search_conn.execute(
+                    "SELECT COUNT(*) as count FROM messagesfts"
+                )
+                fts_row_count = cursor.fetchone()['count'] or 0
+            finally:
+                search_conn.close()
+        except sqlite3.OperationalError:
+            fts_row_count = -1
+
+        return {
+            "accounts": accounts,
+            "fts_index": {"row_count": fts_row_count},
+            "anyStale": stale_any,
+            "staleThresholdMinutes": stale_threshold_minutes,
+            "owned_by": (
+                "Spark Desktop owns sync. This MCP reads its store read-only; "
+                "to force a refresh, open Spark and let it fetch new mail."
+            ),
+        }
 
     def get_email(self, message_pk: int) -> Optional[Dict[str, Any]]:
         """Get full email content.

@@ -69,16 +69,27 @@ TOOLS: list[Tool] = [
         description="""List recent emails from a folder. PREFERRED for finding emails by sender or recent activity.
 
 WHEN TO USE THIS vs search_emails:
-- Use list_emails when looking for emails FROM a specific person (use sender filter)
+- Use list_emails when looking for emails FROM a specific person (use the sender_* filters)
 - Use list_emails when looking for recent correspondence
 - Use list_emails first to browse recent activity, then search_emails for specific content
 
-This tool is more reliable than search_emails for finding threads by correspondent.""",
+SENDER FILTERS (prefer these over the legacy `sender` param):
+- sender_name: find by person's display name (matches the From header AND signature body)
+- sender_email: find by exact email address (or substring of the localpart)
+- sender_domain: find by organization domain (EXACT match, e.g. "uchicago.edu" — won't false-match "taylorwessing.com" on "taylo")
+- sender: legacy convenience; tries name → email → domain. Less predictable; prefer the structured fields.
+
+If you only know the name and the sender's email has no display-name header (e.g. ctaylo@uchicago.edu signed "Christine Taylo"), sender_name will still find it via the signature body fallback.""",
         inputSchema={
             "type": "object",
             "properties": {
-                "folder": {"type": "string", "description": "inbox/sent/all", "default": "inbox"},
-                "sender": {"type": "string", "description": "Filter by sender email or name (partial match)"},
+                "folder": {"type": "string", "description": "inbox/sent/drafts/all. If omitted, defaults to 'inbox' unless any sender filter is set, in which case it broadens to 'all' (archived mail is otherwise excluded)."},
+                "sender": {"type": "string", "description": "Legacy: tries name → email → domain. Prefer sender_name/sender_email/sender_domain."},
+                "sender_name": {"type": "string", "description": "Person's display name (substring match against From header + signature)."},
+                "sender_email": {"type": "string", "description": "Exact email if it contains '@', otherwise substring of the localpart."},
+                "sender_domain": {"type": "string", "description": "Exact organization domain (no substring matching)."},
+                "fuzzy": {"type": "boolean", "description": "Try localpart heuristics for sender_name (e.g., 'ctaylo' for 'Christine Taylo'). Default: true.", "default": True},
+                "verbose": {"type": "boolean", "description": "Include a `diagnostics` block in the response.", "default": False},
                 "limit": {"type": "number", "description": "Max results", "default": 20}
             }
         }
@@ -92,27 +103,47 @@ IMPORTANT - FTS5 BEHAVIOR:
 - This often FAILS for finding threads because names may be in headers/signatures, not body text
 - If a multi-word search returns nothing, TRY EACH WORD SEPARATELY
 
-SEARCH STRATEGY (do this in order):
-1. First try list_emails with sender filter to find emails from a person
-2. If searching for a topic/project, use a SINGLE distinctive keyword, not multiple words
-3. If first search fails, try alternative terms (company name, project name, invoice number separately)
-4. For phrases, use quotes: "exact phrase here"
+SENDER FILTERS (prefer these over the legacy `sender` param):
+- sender_name: person's display name (matches header AND signature body)
+- sender_email: exact email or substring of the localpart
+- sender_domain: EXACT organization domain (e.g. "uchicago.edu")
+- sender: legacy convenience; tries name → email → domain.
 
-EXAMPLES:
-- Looking for "Bittner about NetApp"? Use sender="bittner" + query="NetApp" + sort_by="date"
-- Looking for invoice #INV-123? Search for "INV-123" alone
-- Recent emails about a topic? Use query + sort_by="date" to get newest first""",
+SEARCH STRATEGY:
+1. For "emails from X about Y": use sender_name="X" + query="Y" (single keyword) + sort_by="date"
+2. For invoice #INV-123: search for "INV-123" alone
+3. If a multi-word query returns nothing, try each word separately
+4. For phrases, use quotes: "exact phrase here\"""",
         inputSchema={
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "Search terms. Use single keywords for best results. Multiple words are AND-ed together."},
-                "sender": {"type": "string", "description": "Filter by sender email/name (partial match). Combine with query for 'emails from X about Y'."},
+                "sender": {"type": "string", "description": "Legacy: tries name → email → domain. Prefer sender_name/sender_email/sender_domain."},
+                "sender_name": {"type": "string", "description": "Person's display name (substring match)."},
+                "sender_email": {"type": "string", "description": "Exact email if it contains '@', otherwise substring of the localpart."},
+                "sender_domain": {"type": "string", "description": "Exact organization domain."},
+                "fuzzy": {"type": "boolean", "description": "Try localpart heuristics for sender_name. Default: true.", "default": True},
                 "start_date": {"type": "string", "description": "ISO date (YYYY-MM-DD). Only emails after this date."},
                 "end_date": {"type": "string", "description": "ISO date (YYYY-MM-DD). Only emails before this date."},
                 "sort_by": {"type": "string", "description": "relevance (default) or date (newest first)", "default": "relevance"},
+                "verbose": {"type": "boolean", "description": "Include a `diagnostics` block in the response.", "default": False},
                 "limit": {"type": "number", "description": "Max results", "default": 10}
             },
             "required": ["query"]
+        }
+    ),
+    Tool(
+        name="index_status",
+        description="""Report the state of Spark's underlying message store (read-only diagnostic).
+
+Use this when a query returns no results to distinguish "no such email" from "Spark hasn't fetched it yet." Returns per-account totals, newest/oldest message timestamps, and a `stale` flag per account.
+
+Note: Spark Desktop owns mail sync. This MCP reads its store; if accounts are stale, open Spark and let it fetch new mail.""",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "staleThresholdMinutes": {"type": "number", "description": "An account is flagged stale if its newest message is older than this many minutes.", "default": 30}
+            }
         }
     ),
     Tool(
@@ -482,8 +513,13 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
         # EMAIL TOOLS
         elif name == "list_emails":
             result = db.list_emails(
-                folder=arguments.get("folder", "inbox"),
+                folder=arguments.get("folder"),
                 sender=arguments.get("sender"),
+                sender_name=arguments.get("sender_name"),
+                sender_email=arguments.get("sender_email"),
+                sender_domain=arguments.get("sender_domain"),
+                fuzzy=arguments.get("fuzzy", True),
+                verbose=arguments.get("verbose", False),
                 limit=int(arguments.get("limit", 20))
             )
             return [TextContent(type="text", text=json.dumps(result, indent=2))]
@@ -495,10 +531,21 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
             result = db.search_emails(
                 query=query,
                 sender=arguments.get("sender"),
+                sender_name=arguments.get("sender_name"),
+                sender_email=arguments.get("sender_email"),
+                sender_domain=arguments.get("sender_domain"),
+                fuzzy=arguments.get("fuzzy", True),
                 start_date=arguments.get("start_date"),
                 end_date=arguments.get("end_date"),
                 sort_by=arguments.get("sort_by", "relevance"),
+                verbose=arguments.get("verbose", False),
                 limit=int(arguments.get("limit", 10))
+            )
+            return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+        elif name == "index_status":
+            result = db.index_status(
+                stale_threshold_minutes=int(arguments.get("staleThresholdMinutes", 30))
             )
             return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
