@@ -3,6 +3,7 @@
 import sqlite3
 import json
 import re
+import time
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime, timedelta
@@ -179,26 +180,51 @@ class SparkDatabase:
         if not self.calendar_db_path.exists():
             raise FileNotFoundError(f"Calendar database not found at {self.calendar_db_path}")
 
-    def _connect_messages(self) -> sqlite3.Connection:
-        """Connect to messages database in read-only mode with timeout."""
-        conn = sqlite3.connect(f"file:{self.messages_db_path}?mode=ro", uri=True, timeout=5.0)
+    def _connect(self, db_path: Path) -> sqlite3.Connection:
+        """Open a Spark SQLite database read-only, resilient to live writes.
+
+        Spark Desktop keeps these databases in WAL mode and writes to them
+        continuously. A plain ``mode=ro`` open has to map the live ``-shm``
+        shared-memory file, and when Spark checkpoints or rotates ``-shm``/``-wal``
+        between calls the open fails with SQLITE_CANTOPEN ("unable to open
+        database file"). We retry a few times to ride out transient checkpoint
+        windows, then fall back to ``immutable=1``, which reads the main database
+        file directly and ignores ``-wal``/``-shm`` entirely.
+
+        Trade-off: the ``immutable=1`` fallback does not see un-checkpointed rows
+        still sitting in the ``-wal`` file, so the very newest emails may be
+        missing until Spark checkpoints. The normal ``mode=ro`` path (tried
+        first) sees everything.
+        """
+        last_err: Optional[Exception] = None
+        for attempt in range(3):
+            try:
+                conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA query_only = ON")
+                return conn
+            except sqlite3.OperationalError as e:
+                last_err = e
+                time.sleep(0.25 * (attempt + 1))
+
+        # Fallback: immutable open ignores the live -wal/-shm and cannot fail
+        # on checkpoint contention. May miss the newest un-checkpointed rows.
+        conn = sqlite3.connect(f"file:{db_path}?immutable=1", uri=True, timeout=5.0)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA query_only = ON")
         return conn
+
+    def _connect_messages(self) -> sqlite3.Connection:
+        """Connect to messages database in read-only mode with timeout."""
+        return self._connect(self.messages_db_path)
 
     def _connect_search(self) -> sqlite3.Connection:
         """Connect to search database in read-only mode with timeout."""
-        conn = sqlite3.connect(f"file:{self.search_db_path}?mode=ro", uri=True, timeout=5.0)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA query_only = ON")
-        return conn
+        return self._connect(self.search_db_path)
 
     def _connect_calendar(self) -> sqlite3.Connection:
         """Connect to calendar database in read-only mode with timeout."""
-        conn = sqlite3.connect(f"file:{self.calendar_db_path}?mode=ro", uri=True, timeout=5.0)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA query_only = ON")
-        return conn
+        return self._connect(self.calendar_db_path)
 
     def list_transcripts(
         self,
