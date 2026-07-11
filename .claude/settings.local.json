@@ -15,7 +15,14 @@
       "Bash(git commit:*)",
       "Bash(git push)",
       "Bash(grep:*)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(tree:*)",
+      "WebFetch(domain:law.justia.com)",
+      "Bash(cat:*)",
+      "Bash(git pull:*)",
+      "Bash(make:*)",
+      "Bash(open:*)",
+      "Bash(git stash:*)"
     ],
     "deny": [],
     "ask": []
