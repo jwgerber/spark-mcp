@@ -160,7 +160,9 @@ class SparkDatabase:
     """Access Spark Desktop SQLite databases in read-only mode."""
 
     def __init__(self, base_dir: Optional[Path] = None, cache_dir: Optional[Path] = None):
-        """Initialize database connections.
+        """Store database paths. Existence is checked lazily per connect so
+        the MCP server can still serve PDF tools when Spark Desktop is not
+        installed or the cache is missing.
 
         Args:
             base_dir: Override the Spark core-data directory (for tests).
@@ -173,14 +175,11 @@ class SparkDatabase:
         self.search_db_path = base / "search_fts5.sqlite"
         self.calendar_db_path = base / "calendarsapi.sqlite"
 
-        if not self.messages_db_path.exists():
-            raise FileNotFoundError(f"Messages database not found at {self.messages_db_path}")
-        if not self.search_db_path.exists():
-            raise FileNotFoundError(f"Search database not found at {self.search_db_path}")
-        if not self.calendar_db_path.exists():
-            raise FileNotFoundError(f"Calendar database not found at {self.calendar_db_path}")
+    def _require_db(self, path: Path, label: str) -> None:
+        if not path.exists():
+            raise FileNotFoundError(f"{label} database not found at {path}")
 
-    def _connect(self, db_path: Path) -> sqlite3.Connection:
+    def _connect(self, db_path: Path, label: str) -> sqlite3.Connection:
         """Open a Spark SQLite database read-only, resilient to live writes.
 
         Spark Desktop keeps these databases in WAL mode and writes to them
@@ -196,6 +195,7 @@ class SparkDatabase:
         missing until Spark checkpoints. The normal ``mode=ro`` path (tried
         first) sees everything.
         """
+        self._require_db(db_path, label)
         last_err: Optional[Exception] = None
         for attempt in range(3):
             try:
@@ -216,15 +216,15 @@ class SparkDatabase:
 
     def _connect_messages(self) -> sqlite3.Connection:
         """Connect to messages database in read-only mode with timeout."""
-        return self._connect(self.messages_db_path)
+        return self._connect(self.messages_db_path, "Messages")
 
     def _connect_search(self) -> sqlite3.Connection:
         """Connect to search database in read-only mode with timeout."""
-        return self._connect(self.search_db_path)
+        return self._connect(self.search_db_path, "Search")
 
     def _connect_calendar(self) -> sqlite3.Connection:
         """Connect to calendar database in read-only mode with timeout."""
-        return self._connect(self.calendar_db_path)
+        return self._connect(self.calendar_db_path, "Calendar")
 
     def list_transcripts(
         self,
@@ -458,8 +458,12 @@ class SparkDatabase:
                 LIMIT ?
             """
 
-        cursor = search_conn.execute(fts_query, (query, limit * 2))
-        fts_rows = cursor.fetchall()
+        try:
+            cursor = search_conn.execute(fts_query, (query, limit * 2))
+            fts_rows = cursor.fetchall()
+        except sqlite3.OperationalError:
+            search_conn.close()
+            return {'results': [], 'total': 0, 'error': 'invalid search syntax'}
         search_conn.close()
 
         if not fts_rows:
@@ -1852,29 +1856,47 @@ class SparkDatabase:
     def _get_attachment_path(self, message_pk: int, filename: str) -> Optional[Path]:
         """Get the filesystem path for an attachment.
 
-        Args:
-            message_pk: Message primary key
-            filename: Attachment filename
-
-        Returns:
-            Path object or None if cannot be determined
+        The ``filename`` comes from email MIME headers (attacker-controlled),
+        so we strictly reject path separators and null bytes, and verify that
+        the final path stays inside the message's own cache directory. This
+        prevents a malicious sender from using ``../`` to read arbitrary files
+        under the user's home directory.
         """
-        if not filename:
+        if not filename or not isinstance(filename, str):
+            return None
+        if "\x00" in filename or "/" in filename or "\\" in filename:
+            return None
+        if filename in (".", ".."):
             return None
 
-        # Spark stores attachments in: Caches/Spark Desktop/messagesData/1/{messagePk}/{filename}
-        # The "1" appears to be an account ID, checking if the file exists
-        path = SPARK_CACHE / "messagesData" / "1" / str(message_pk) / filename
-        if path.exists():
-            return path
+        candidates = [
+            SPARK_CACHE / "messagesData" / "1" / str(message_pk),
+            SPARK_CACHE / "messagesData" / str(message_pk),
+        ]
 
-        # Try without account ID subfolder
-        path = SPARK_CACHE / "messagesData" / str(message_pk) / filename
-        if path.exists():
-            return path
+        for base in candidates:
+            try:
+                base_resolved = base.resolve(strict=False)
+                candidate = (base / filename).resolve(strict=False)
+            except (OSError, RuntimeError):
+                continue
+            # Ensure the composed path stays within the message's folder.
+            try:
+                candidate.relative_to(base_resolved)
+            except ValueError:
+                continue
+            if candidate.exists():
+                return candidate
 
-        # Return the most likely path even if it doesn't exist yet
-        return SPARK_CACHE / "messagesData" / "1" / str(message_pk) / filename
+        # Fall back to the canonical location only if it would be safe.
+        base = SPARK_CACHE / "messagesData" / "1" / str(message_pk)
+        try:
+            base_resolved = base.resolve(strict=False)
+            candidate = (base / filename).resolve(strict=False)
+            candidate.relative_to(base_resolved)
+        except (OSError, RuntimeError, ValueError):
+            return None
+        return candidate
 
     # ============================================================================
     # COMBINED INTELLIGENCE
